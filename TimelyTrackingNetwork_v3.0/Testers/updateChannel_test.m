@@ -1,0 +1,27 @@
+% Ensure updateChannel is bidirectional and functioning
+% W.W.Howard, Wireless@VT, {wwhoward}@vt.edu
+
+clc;clear;close all
+
+update_rate = 0.75; % average # times each node updates per second
+coverage = 0.25; % portion of region each node covers
+nTrackers = 7; 
+
+myTargets = targetModel(10); 
+for i = 1:nTrackers
+    myTrackers{i} = targetTracker(i, 'Coverage', coverage); % coverage 2pi to guarentee total region coverage
+end
+myFC = fusionCenter(myTargets, myTrackers, 'centralized_random', update_rate); 
+% myFC = fusionCenter(myTargets, myTrackers, 'all', update_rate); 
+
+t_step = 0.5; 
+for t = 0:t_step:50
+    t
+    myTargets.update(t_step); 
+    for i = 1:nTrackers
+        myTrackers{i}.observe(myTargets, t); 
+    end
+    myFC.getUpdates(t); 
+end
+myFC.plotScene(); 
+myFC.plotTarget(1:20)

@@ -1,0 +1,528 @@
+classdef fusionCenter < handle
+    %FUSIONCENTER Written for TTT Journal by W.W.Howard in Spring 2023
+    %   Functions as a fusion center, combining observations from several
+    %   'targetTracker' objects tracking 'targetModel'. 
+    % 
+    % Version information: 
+    % v3.0
+    % 
+    % Primarily for the study of Age of Information metrics as applied to
+    % Cognitive Radar Networks. 
+
+    % Also built with mode control in mind... 
+    % 
+    % Contact: {wwhoward}@vt.edu
+
+    properties
+        Targets
+        updateChannels
+
+        ActiveTargets = []
+        Stats = dictionary(); 
+
+        % Switches
+        doStatistics = true % Should error, etc, be calculated? 
+    end % end public properties
+
+    properties(Access=private)
+        Capacity
+        updateRate
+        Bandit
+        targetModel
+        targetTrackers
+        selectNodes
+        activeTargetsSeenByNodes = {}
+        activeNodesSeenByTargets = {}
+        nTrackers
+        NodePositions
+        Time = 0
+        update_times = [0]
+        updated_nodes = {}; 
+        updated_targets = {}; 
+    end % end private properties
+    
+    methods(Access=public)
+        function obj = fusionCenter(targetModel, targetTrackers, decisionType, updateRate)
+            %FUSIONCENTER fuses measurements from targetTracker, works with targetModel 
+            % Required inputs: 
+                % targetModel: model of target behavior
+                % targetTrackers: objects which do the tracking
+                % decisionType: How the FC collects observations
+                % updateRate: how often each node can provide updates
+            
+            obj.targetModel = targetModel; 
+            obj.targetTrackers = targetTrackers; 
+            obj.updateRate = updateRate; 
+
+            obj.nTrackers = length(targetTrackers); 
+            
+            switch decisionType
+                case 'all'
+                    obj.selectNodes = @obj.getAllUpdates; 
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod('centralized'); 
+                    end % end for
+                case 'timely'
+                    obj.selectNodes = @obj.getTimelyUpdates; 
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod('centralized'); 
+                    end % end for
+                case 'distributed'
+                    obj.selectNodes = @obj.getDistributedUpdates; 
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod(decisionType); 
+                    end % end for
+                case 'bandit'
+                    obj.selectNodes = @obj.getBanditUpdates; 
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod('centralized'); 
+                    end % end for
+                case 'centralized_random'
+                    obj.selectNodes = @obj.getCentralizedRandomUpdates; 
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod('centralized'); 
+                    end % end for
+                case 'distributed_random'
+                    obj.selectNodes = @obj.getDistributedRandomUpdates;
+                    for i = 1:obj.nTrackers
+                        obj.targetTrackers{i}.setUpdateMethod(decisionType); 
+                    end % end for
+            end % end switch
+            
+            % Initialize trackers
+            for n_tracker = 1:length(obj.targetTrackers)
+                % Instance update channels, provide access to trackers. 
+                obj.updateChannels{n_tracker} = updateChannel(); 
+                obj.targetTrackers{n_tracker}.updateChannels = obj.updateChannels{n_tracker}; 
+
+                % Populate activeTrackerTargets, keeps record of who sees who 
+                obj.activeTargetsSeenByNodes{i} = []; 
+
+                % Register where our nodes live
+                obj.NodePositions(:, n_tracker) = obj.targetTrackers{n_tracker}.NodePosition; 
+            end % end for
+
+            if obj.doStatistics
+                obj.Stats("TimeSteps") = {[]}; % for plotting
+                obj.Stats("Error") = {[]}; % Pstates error for tracked targets
+                obj.Stats("RMSE") = {[]}; % Root mean squared error for tracked targets
+                obj.Stats("Age") = {[]}; % Average age of tracked targets 
+                obj.Stats("PeakAge") = {[]}; % Average peak age of tracked targets
+
+                obj.Stats("nTotalTargets") = {[]}; % Total targets in targetModel. Don't need a TotalTargets bc it = 1:nTotalTargets. 
+                obj.Stats("nActiveTargets") = {[]}; % Total active targets in targetModel 
+                obj.Stats("nObservedTargets") = {[]}; % Number of targets observed in this time step
+                obj.Stats("nCoveredTargets") = {[]}; % Number of covered targets in this time step
+                obj.Stats("nTrackedTargets") = {[]}; % Number of targets for which a FC track exists in this time step
+                obj.Stats("nSelectedNodes") = {[]}; % How many nodes were selected? 
+
+                obj.Stats("ActiveTargets") = {[]}; % Index of active targets in targetModel                 
+                obj.Stats("ObservedTargets") = {[]}; % Targets observed in this time step
+                obj.Stats("CoveredTargets") = {[]}; % Targets covered in this time step (aka total observable targets)
+                obj.Stats("TrackedTargets") = {[]}; % Targets for which a FC track exists in this time step                             
+                obj.Stats("SelectedNodes") = {[]}; % Which nodes were selected? 
+
+                obj.Stats("TrackError") = {{[]}}; % Error for each track
+                obj.Stats("TrackUpdateTimes") = {{[]}}; % Update times for each track
+            end
+        end % end fusionCenter
+
+        function [] = getUpdates(obj, t)
+            % Doesn't really get updates - just iterates the update selection algo
+            % Each method (save 'all') should have an average update rate
+            % according to the network capacity. 
+            % 
+            % Options: 
+            %   'all': causes all targetTrackers to push updates every time
+            %       getUpdates is called
+            %   'timely': implements track-sensitive AoI metric from [1]
+            %   'bandit': Selects arms according to Upper Confidence Bound
+            %   'centralized_random': Selects a constant number of random
+            %       nodes for updates based on the update rate. 
+            %   'distributed': Implements AoII based distributed updating
+            %   'distributed_random': Each node provides updates randomly.
+            %       This results in a Poisson number of random updates per
+            %       interval with the same mean as centralized_random. 
+
+            % TODO Think if there's a more efficient way of doing the below
+            
+            % Select nodes
+            [selectedNodes] = obj.selectNodes(t); 
+
+            % This has to go somewhere so I'm putting it here. 
+            % ---------------------------
+            % Possible Target Transitions
+            % ---------------------------
+            % For this small section, 'state' refers to target observability. 
+            % State Diagram: 
+            % -------------------------------------------------------------
+            % | All Targets at Time $t$                                   |
+            % |                                                           |
+            % |  -----------------------------   ------------------------ |
+            % |  | All Active Targets        |   | All Retired Targets  | |
+            % |  | -----------  ------------||   | ----------- ---------| |
+            % |  | | In Range|  |Was seen,  ||   | | Retired | | Other || |
+            % |  | | A1      |  | Now Not   ||   | | In Range| | R2    || |
+            % |  | -----------  |    A2     ||   | |  R1     | |       || |
+            % |  |              -------------|   | ----------- ---------| |
+            % |  | ------------------        |   ------------------------ |
+            % |  | | Never In Range |        |                            |
+            % |  | |     A3         |        |                            |
+            % |  | ------------------        |                            |
+            % |  -----------------------------                            |
+            % -------------------------------------------------------------
+            %
+            % Valid Non-Degenerate Transitions: 
+            % A1 -> R1 | Track Existed, Now Doesn't
+            % A1 -> A2 | Track Existed, Now Doesn't 
+            % A2 -> A1 | Gap in Coverage
+            % A2 -> R2 | Not Observable
+            % A3 -> R2 | Not Observable
+            % 
+            % These omit targets which are in range of nodes not selected! 
+            % 
+
+            
+            td = t - obj.Time; 
+            for i = 1:length(obj.Targets)
+                % If target is inactive, no need to process
+                if ismember(i, obj.ActiveTargets)
+                    % Update age of every target (set to 0 later if update rx)
+                    obj.Targets{i}.Age = obj.Targets{i}.Age + td; 
+                    obj.Targets{i}.AgeHist(end+1) = obj.Targets{i}.Age; 
+                    obj.Targets{i}.ActiveTimes(end+1) = t;                 
+
+                    % Predict each Kalman filter
+                    % This happens every time getUpdates is called so that 
+                    %   anything output is as correct as possible
+                    pstate = predict(obj.Targets{i}.Filter, td); 
+                    obj.Targets{i}.FilteredTrack(:,end+1) = pstate; 
+                    
+                    % Determine the closest node
+                    tmp_nodes = obj.activeNodesSeenByTargets{i}; 
+                    [~, tmp_closest] = min(vecnorm(pstate([1,3])-obj.NodePositions(:,tmp_nodes))); 
+                    obj.Targets{i}.ClosestNode = tmp_nodes(tmp_closest); 
+                end
+                
+            end            
+
+            % Receive updates
+            state = zeros(4, length(obj.Targets), length(selectedNodes)); 
+            updatedTargets = []; % Transitions A1 -> A1, A2 -> A1
+            absentTargets = [];  % Transitions A1 -> R1, A1 -> A2
+            newTargets = [];     % Spawned Targets 
+            activeTargetMask = []; % Indicates which links are active
+            for i = 1:length(selectedNodes)
+                update = obj.updateChannels{selectedNodes(i)}.updates{end}; 
+                
+                all_tracks = update{1}; 
+                activeTargets = update{2}; 
+                % active_tracks = {}; 
+                if ~isempty(activeTargets)
+                    % active_tracks = all_tracks{activeTargets}; 
+                end
+                
+                for j = 1:length(activeTargets)
+                    state(:, activeTargets(j), selectedNodes(i)) = all_tracks{activeTargets(j)}.FilteredTrack(:,end); 
+                    % Populate obj.activeNodesSeenByTargets...
+                    if length(obj.activeNodesSeenByTargets) < activeTargets(j)
+                        obj.activeNodesSeenByTargets{activeTargets(j)} = []; 
+                    end
+                    tmp = union(obj.activeNodesSeenByTargets{activeTargets(j)}, selectedNodes(i)); 
+                    obj.activeNodesSeenByTargets{activeTargets(j)} = tmp; 
+                end
+
+                updatedTargets = union(updatedTargets, intersect(activeTargets, obj.activeTargetsSeenByNodes{selectedNodes(i)})); 
+                absentTargets = union(absentTargets, setdiff(obj.activeTargetsSeenByNodes{selectedNodes(i)}, activeTargets)); 
+                newTargets = union(newTargets, setdiff(activeTargets, obj.activeTargetsSeenByNodes{selectedNodes(i)})); 
+
+                tmp = union(obj.activeTargetsSeenByNodes{selectedNodes(i)}, activeTargets)'; 
+                % Force to row vector
+                obj.activeTargetsSeenByNodes{selectedNodes(i)} = tmp(:).';
+                activeTargetMask(activeTargets, selectedNodes(i)) = 1; 
+            end % end for
+
+            % otherNodes = setdiff(1:obj.nTrackers, selectedNodes); 
+            % allActiveTargets = union([obj.activeTargetsSeenByNodes{otherNodes}], updatedTargets); 
+            
+            % It's possible that a target left one region and entered another 
+            absentTargets = setdiff(absentTargets, updatedTargets);
+            newTargets = setdiff(newTargets, updatedTargets); 
+
+
+            % Instance new targets
+            for i = 1:length(newTargets)
+                tmp_state = mean(squeeze(state(:,newTargets(i),activeTargetMask(newTargets(i),:)==1)), 2); 
+
+                obj.Targets{newTargets(i)} = {};
+                obj.Targets{newTargets(i)}.Filter = obj.initializeFilter(tmp_state);
+                obj.Targets{newTargets(i)}.Track = tmp_state; % Raw observations
+                obj.Targets{newTargets(i)}.FilteredTrack = predict(obj.Targets{newTargets(i)}.Filter, 0); % Filtered observations
+                obj.Targets{newTargets(i)}.isActive = 1;
+                obj.Targets{newTargets(i)}.FlagHistory = []; % "something interesting happened"
+                obj.Targets{newTargets(i)}.Age = 0;
+                obj.Targets{newTargets(i)}.AgeHist = 0; 
+                obj.Targets{newTargets(i)}.PeakAges = []; 
+                obj.Targets{newTargets(i)}.State = 0;
+                obj.Targets{newTargets(i)}.ModelProb = [0.5, 0.5];
+                obj.Targets{newTargets(i)}.Transitions = zeros(2,2);
+                obj.Targets{newTargets(i)}.TransitionProb = 0.5*ones(2,2);
+                obj.Targets{newTargets(i)}.UpdateTimes = t;
+                obj.Targets{newTargets(i)}.ActiveTimes = t; 
+                [~, obj.Targets{newTargets(i)}.ClosestNode] = min(vecnorm(tmp_state([1,3])-obj.NodePositions)); 
+            end
+
+            % Mark absentTargets as inactive
+            for i = 1:length(absentTargets)
+                % If the closest node can't see this guy, likely he's gone
+                if ismember(obj.Targets{absentTargets(i)}.ClosestNode, selectedNodes)
+                    obj.Targets{absentTargets(i)}.isActive = 0; 
+                    obj.ActiveTargets = setdiff(obj.ActiveTargets, absentTargets(i)); 
+                % Else, if only the currently polled nodes can't see him, 
+                %   remove them from obj.activeNodesSeenByTargets and
+                %   obj.activeTargetsSeenByNodes
+                else
+                    % Remove polled nodes from NbyT
+                    tmp_NbyT = setdiff(obj.activeNodesSeenByTargets{absentTargets(i)}, selectedNodes); 
+                    obj.activeNodesSeenByTargets{absentTargets(i)} = tmp_NbyT; 
+                    % Remove this target from polled nodes TbyN
+                    for j = 1:length(selectedNodes)
+                        tmp_TbyN = setdiff(obj.activeTargetsSeenByNodes{selectedNodes(j)}, absentTargets(i)); 
+                        obj.activeTargetsSeenByNodes{selectedNodes(j)} = tmp_TbyN; 
+                    end
+                end
+            end
+
+            % Lastly, update filters for observed targets
+            for i = 1:length(updatedTargets)
+                % td = t - obj.Targets{updatedTargets(i)}.UpdateTimes(end); 
+                obj.Targets{updatedTargets(i)}.UpdateTimes(end+1) = t; 
+
+                % Decide which measurements to use for correcting
+                pstate = obj.Targets{updatedTargets(i)}.FilteredTrack(:,end); % Already calculated above
+                obs_nodes = find(activeTargetMask(updatedTargets(i),:)==1); 
+                [~, selected_idx] = min(vecnorm(pstate([1,3])-obj.NodePositions(:,obs_nodes))); 
+                selected_idx = obs_nodes(selected_idx); 
+
+                % get the measurement 
+                tmp_state = state(:, updatedTargets(i), selected_idx); 
+                obj.Targets{updatedTargets(i)}.Track(:,end+1) = tmp_state; 
+
+                % Update the appropriate filter
+                % Replace the end with this, since it's currently the
+                % pstate value
+                obj.Targets{updatedTargets(i)}.FilteredTrack(:,end) = correct(obj.Targets{updatedTargets(i)}.Filter, [tmp_state([1,3]); 0]);
+
+                % Update age, etc
+                obj.Targets{updatedTargets(i)}.PeakAges(end+1) = obj.Targets{updatedTargets(i)}.Age; 
+                obj.Targets{updatedTargets(i)}.Age = 0; % Reset age for updated targets
+                obj.Targets{updatedTargets(i)}.AgeHist(end) = 0; % Reset age for updated targets                
+            end % end for
+
+            % Update obj.activeTargets: list of all active targets
+            obj.ActiveTargets = unique([obj.activeTargetsSeenByNodes{1:end}]); 
+
+            % Record which targets were seen
+            obj.updated_nodes{end+1} = selectedNodes; 
+            obj.updated_targets{end+1} = union(updatedTargets, newTargets); 
+
+            % Last thing: Update internal time
+            obj.Time = t;
+
+            if obj.doStatistics; obj.UpdateStatistics(); end 
+        end % end getUpdates
+
+        % Plotters
+        function [] = plotScene(obj)
+            % Plots current positions of nodes and targets
+
+            % Get node locations
+            for i = 1:obj.nTrackers
+                nodePos(:,end+1) = obj.targetTrackers{i}.NodePosition; 
+                nodeRadius(:,end+1) = obj.targetTrackers{i}.ObservableRadius; 
+            end % end for
+
+            figure; hold on
+            % Draw some lines for the legend
+            plot(-510:-500, -510:-500, 'g', 'linewidth', 2, 'displayname', 'Active Track')
+            plot(-510:-500, -510:-500, 'k', 'DisplayName', 'Retired Track')
+            plot(-500, -500, 'xk', 'markersize', 10, 'DisplayName', 'Target Position')
+            plot(-500, -500, 'ob', 'markersize', 10, 'DisplayName', 'Node Position')
+            plot(-510:-500, -510:-500, '--k', 'linewidth', 2, 'DisplayName', 'Region $B$')
+            plot(nsidedpoly(1000, 'Center', [-500, -500], 'Radius', 10), 'FaceColor', 'k', 'DisplayName', '$S_n$')
+            for i = 1:obj.targetModel.nTargets
+                if obj.targetModel.Targets{i}.isActive
+                    tmp = obj.targetModel.Targets{i}.state([1,3]); 
+                    plot(tmp(1), tmp(2), 'xk', 'markersize', 10, 'HandleVisibility','off')
+                    plot(obj.targetModel.Targets{i}.Track(1,:), obj.targetModel.Targets{i}.Track(3,:), 'g', 'linewidth', 2, 'HandleVisibility','off')
+                else
+                    plot(obj.targetModel.Targets{i}.Track(1,:), obj.targetModel.Targets{i}.Track(3,:), 'k', 'HandleVisibility','off')
+                end % end if
+            end
+            plot(nodePos(1,:), nodePos(2,:), 'ob', 'markersize', 10, 'HandleVisibility','off')
+            for i = 1:obj.nTrackers
+                plot(nsidedpoly(1000, 'Center', nodePos(:,i)', 'Radius', nodeRadius(i)), 'FaceColor', 'k', 'HandleVisibility','off'); 
+            end
+            plot([1000, 1000, 0, 0, 1000], [0, 1000, 1000, 0, 0], '--k', 'linewidth', 2, 'HandleVisibility','off')
+            xlim([-100, 1100]); 
+            ylim([-100, 1100]); 
+            legend('interpreter', 'latex', 'location', 'southeast', 'fontsize', 12)
+            title('Tracking Region', 'interpreter', 'latex', 'fontsize', 16)
+        end % end plotScene       
+
+        function plotTarget(obj, idx)
+            % plots FC estimate of target track as well as true target
+            % track
+            % If idx is an array, plots for all 
+            colors = linspecer(length(idx), 'qualitative'); 
+
+            figure; hold on            
+            for i = 1:length(idx)
+                if ismember(idx(i), obj.ActiveTargets)
+                    targ_path = obj.targetModel.Targets{idx(i)}.Track([1,3],:); 
+                    targ_track = obj.Targets{idx(i)}.FilteredTrack([1,3], :); 
+                    targ_pos = obj.targetModel.Targets{idx(i)}.state([1,3]); 
+                    plot(targ_path(1,:), targ_path(2,:), '-', 'color', colors(i,:), 'linewidth', 2, 'HandleVisibility','off')
+                    plot(targ_track(1,:), targ_track(2,:), '.', 'color', colors(i,:), 'MarkerSize', 10, 'HandleVisibility','off')
+                    plot(targ_pos(1), targ_pos(2), 'x', 'color', colors(i,:), 'markersize', 10, 'HandleVisibility','off')
+                end % end if
+            end % end for
+            % Plots for legend
+            plot(-505:-500, -505:-500, '-k', 'linewidth', 2, 'DisplayName', 'Target Path')
+            plot(-505:-500, -505:-500, '.k', 'MarkerSize', 10, 'DisplayName', 'Track')
+            plot(-505:-500, -505:-500, 'xk', 'markersize', 10, 'displayname', 'Final Position')
+            plot(-510:-500, -510:-500, '--k', 'linewidth', 2, 'DisplayName', 'Region $B$')
+            plot([1000, 1000, 0, 0, 1000], [0, 1000, 1000, 0, 0], '--k', 'linewidth', 2, 'HandleVisibility','off')
+            xlim([-100, 1100]); 
+            ylim([-100, 1100]); 
+            legend('location', 'best', 'interpreter', 'latex', 'fontsize', 12)
+            title('Fused Target Tracks', 'interpreter', 'latex', 'fontsize', 16)
+        end % end plotTarget
+    end % end public methods
+
+    methods(Access=private)
+        % Node Selection Routines
+        function [selectedNodes] = getAllUpdates(obj, t)
+            selectedNodes = 1:obj.nTrackers; 
+            for i = 1:obj.nTrackers
+                obj.targetTrackers{i}.update(); 
+            end
+        end % end getAllUpdates
+
+        function [selectedNodes] = getCentralizedRandomUpdates(obj, t)
+            % Select nodes
+            nNodes = obj.nTrackers * obj.updateRate * (t-obj.Time); % Prob per second
+            nNodes = floor(nNodes) + ((nNodes-floor(nNodes))>rand); % Make sure the average is correct
+            
+            selectedNodes = datasample(1:obj.nTrackers, nNodes, 'Replace', false); 
+            
+            % Pull updates
+            for i = 1:nNodes
+                obj.targetTrackers{selectedNodes(i)}.update(); 
+            end % end for
+        end % end getCentralizedRandomUpdates
+
+        function [selectedNodes] = getTimelyUpdates(obj, t)
+            % TODO
+        end 
+
+        function [selectedNodes] = getDistributedUpdates(obj, t)
+            % TODO
+        end
+
+
+        % Statistics
+        function UpdateStatistics(obj)
+            % Calculates stats for all targets in the scene
+
+            obj.Stats{"TimeSteps"}(end+1) = obj.Time; % For plotting
+            obj.Stats{"nTotalTargets"}(end+1) = obj.targetModel.nTargets; % Total targets in model
+            obj.Stats{"nActiveTargets"}(end+1) = obj.targetModel.nActiveTargets; 
+            obj.Stats{"nObservedTargets"}(end+1) = length(obj.updated_targets{end}); 
+            obj.Stats{"nSelectedNodes"}(end+1) = length(obj.updated_nodes{end}); 
+            obj.Stats{"nTrackedTargets"}(end+1) = length(obj.ActiveTargets); 
+
+            obj.Stats{"ObservedTargets"}{end+1} = obj.updated_targets{end}; 
+            obj.Stats{"SelectedNodes"}{end+1} = obj.updated_nodes{end}; 
+            obj.Stats{"TrackedTargets"}{end+1} = obj.ActiveTargets; 
+
+            % All targets
+            tmp_covered_targets = []; 
+            tmp_active_targets = []; 
+            err = []; 
+            age = []; 
+            peak_age = []; 
+            for i = 1:obj.targetModel.nTargets
+                % If its NOT updated, is it covered?                         
+                if ~ismember(i, obj.updated_targets{end})
+                    if ismember(i, obj.ActiveTargets) && ...
+                            norm(obj.targetModel.Targets{i}.state([1,3])' ...
+                            - obj.NodePositions(:, obj.Targets{i}.ClosestNode)) ...
+                            < obj.targetTrackers{obj.Targets{i}.ClosestNode}.ObservableRadius
+                        tmp_covered_targets = union(tmp_covered_targets, i);
+                    else 
+                        [closestRange, closestNode] = min(vecnorm(obj.targetModel.Targets{i}.state([1,3]).'-obj.NodePositions)); 
+                        if closestRange < obj.targetTrackers{closestNode}.ObservableRadius
+                            tmp_covered_targets = union(tmp_covered_targets, i);
+                        end
+                    end % end norm
+                end % end ismember
+
+
+                % If it's still active AND there's a track for it, 
+                if obj.targetModel.Targets{i}.isActive 
+                    % Add to ActiveTargets
+                    tmp_active_targets = union(tmp_active_targets, i); 
+                    if ismember(i, obj.ActiveTargets)
+                        err(end+1) = norm(obj.targetModel.Targets{i}.state([1,3])' - obj.Targets{i}.FilteredTrack([1,3], end)); 
+                        age(end+1) = obj.Targets{i}.Age; 
+                        if ~isempty(obj.Targets{i}.PeakAges)
+                            peak_age(end+1) = mean(obj.Targets{i}.PeakAges); 
+                        else
+                            peak_age(end+1) = 0; 
+                        end
+                        
+                        try % We've already established this variable
+                            obj.Stats{"TrackError"}{i}(end+1) = err(end); 
+                            obj.Stats{"TrackUpdateTimes"}{i}(end+1) = obj.Time; 
+                        catch % Need to establish the variable
+                            obj.Stats{"TrackError"}{i} = []; 
+                            obj.Stats{"TrackUpdateTimes"}{i} = []; 
+                            obj.Stats{"TrackError"}{i}(end+1) = err(end); 
+                            obj.Stats{"TrackUpdateTimes"}{i}(end+1) = obj.Time; 
+                        end
+                    end % end if ismember
+                end % end if isActive
+            end
+            
+            if ~isempty(err) % Also proxy for age
+                obj.Stats{"Error"}(end+1) = mean(err); 
+                obj.Stats{"RMSE"}(end+1) = sqrt(mean(err.^2)); 
+                obj.Stats{"Age"}(end+1) = mean(age); 
+                obj.Stats{"PeakAge"}(end+1) = mean(peak_age); 
+            else
+                obj.Stats{"Error"}(end+1) = 0; 
+                obj.Stats{"RMSE"}(end+1) = 0; 
+                obj.Stats{"Age"}(end+1) = 0; 
+                obj.Stats{"PeakAge"}(end+1) = 0; 
+            end
+            obj.Stats{"ActiveTargets"}{end+1} = tmp_active_targets; 
+            obj.Stats{"CoveredTargets"}{end+1} = union(tmp_covered_targets, obj.updated_targets{end}); 
+            obj.Stats{"nCoveredTargets"}(end+1) = length(obj.Stats{"CoveredTargets"}{end}); 
+
+        end % end updateStatistics
+
+        
+        
+    end % end private methods
+
+    methods(Static)
+        function filter = initializeFilter(state)
+            state = [state([1,3]); 0]; 
+            filter = trackingIMM(); 
+            [~] = predict(filter, 0); 
+            [~] = correct(filter, state); 
+        end % end initializeFilter
+    end % end static methods
+end
+

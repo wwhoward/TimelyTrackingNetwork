@@ -1,0 +1,63 @@
+% First experiment for TTT journal
+% Written for TTT Journal by W.W.Howard in Spring 2023
+% Contact: {wwhoward}@vt.edu Wireless@VT
+% For TimelyTrackingNetwork v3
+
+% Task: For a range of update rates per second, see how the error goes up. 
+
+% Header
+addpath(genpath(pwd))
+clc;clear;close all
+
+% Parameters
+nRep = 30; % Repititions for each parameter
+updateRates = 0.1:0.1:2; % from 0.1 to 5 updates per second
+t_step = 0.5; % Max updateRates gives one update each time step per node
+duration = 30; % #seconds to simulate
+coverage = 0.25; 
+nTrackers = 6; 
+
+stats = cell(length(updateRates), nRep);
+for r = 1:length(updateRates)
+% parfor r = 1:length(updateRates)
+    r
+    for n = 1:nRep
+        myTargets = targetModel(10); 
+        myTrackers = genTrackers(nTrackers, 'Coverage', coverage);
+        myFC = fusionCenter(myTargets, myTrackers, 'centralized_random', updateRates(r)); 
+        tic
+        for t = 0:t_step:duration
+            myTargets.update(t_step); 
+            for i = 1:nTrackers
+                myTrackers{i}.observe(myTargets, t); 
+            end
+            myFC.getUpdates(t); 
+        end
+        toc
+        % Export statistics
+        stats{r, n} = myFC.Stats; 
+    end % end for nRep
+end % end for length(updateRates)
+
+mean_stats = AverageStats(stats); 
+
+myFC.plotScene(); 
+myFC.plotTarget(1:20)
+
+figure; 
+plot(mean_stats{"TimeSteps"}, mean_stats{"Error"}); 
+
+figure; hold on
+plot(mean_stats{"TimeSteps"}, mean_stats{"nCoveredTargets"})
+plot(mean_stats{"TimeSteps"}, mean_stats{"nTrackedTargets"})
+plot(mean_stats{"TimeSteps"}, mean_stats{"nTotalTargets"})
+
+figure; hold on
+plot(mean_stats{"TimeSteps"}, mean_stats{"Age"}, '-k', 'linewidth', 2, 'DisplayName', 'Average Age')
+plot(mean_stats{"TimeSteps"}, mean_stats{"PeakAge"}, '--k', 'linewidth', 2, 'DisplayName', 'Peak Age')
+xlabel('Time, $s$', 'interpreter', 'latex', 'fontsize', 12)
+ylabel('Age', 'interpreter', 'latex', 'fontsize', 12)
+legend('interpreter', 'latex', 'fontsize', 12)
+title('Network Ages', 'interpreter', 'latex', 'fontsize', 16)
+
+

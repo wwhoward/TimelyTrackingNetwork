@@ -1,0 +1,6 @@
+% Ensure targetTracker v3.0 performs as expected
+% W.W.Howard, Wireless@VT, {wwhoward}@vt.edu
+
+clc;clear;close all
+
+myTracker = {targetTracker(1, 'tmp', 50, 'Coverage', 1)}; 

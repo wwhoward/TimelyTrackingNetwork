@@ -1,0 +1,48 @@
+function [averageStats] = AverageStats(stats)
+%AVERAGESTATS Written for TTT Journal by W.W.Howard in Spring 2023
+% Version information: 
+% For TimelyTrackingNetwork v3.0
+% Contact: {wwhoward}@vt.edu
+
+% Input: 
+% Stats -> (nParam by nRep)
+
+% Output: 
+% averageStats -> stats, averaged over the nRep dimension
+
+averageStats = dictionary(); 
+nParams = size(stats, 1); 
+nRep = size(stats, 2); 
+
+
+% Get initial TimeSteps for comparison
+baseTimeSteps = stats{1,1}{"TimeSteps"}; 
+nSteps = length(baseTime)
+
+age = zeros(nParams, nRep, nSteps); 
+peak_age = []; 
+err = []; 
+rmse = []; 
+covered = []; 
+tracked = []; 
+total = []; 
+
+for p = 1:nParams
+    for n = 1:nRep
+        if any(stats{p, n}{"TimeSteps"} ~= baseTimeSteps)
+            error("Can't synchronize time steps... ")
+        end
+
+
+    end % end for nRep
+end % end for nParams
+
+
+% Notes
+% Need age, peak age, error, rmse, covered t, tracked t, total t
+
+
+
+
+end
+
